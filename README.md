@@ -23,8 +23,8 @@ Measures P2P latency using a custom CUDA kernel that performs direct remote
 reads (single cacheline, 128 bytes) via P2P-mapped pointers. Single-thread, single-block launches isolate the
 true hardware transfer latency from API overhead.
 
-Produces a **Latency Score** — ratio of average 1:1 (isolated) latency to
-average all-GPUs-concurrent latency. 1.0 = no degradation under full load.
+Reports the best-pair P2P latency and loaded latency (avg and max) when all
+GPUs read from all peers simultaneously.
 
 ## Tests
 
@@ -65,10 +65,8 @@ Requires CUDA toolkit and a C++20 compiler (`nvcc` with `-std=c++20`).
 
 ```
 ===========================================================
-  AVG 1:1 LATENCY:         3.42 us
-  AVG LOADED LATENCY:      6.81 us  (all GPUs concurrent)
-
-  LATENCY SCORE:           0.50
-  (1.00 = no degradation under load)
+  P2P LATENCY (1:1):       4.10 us  (best pair)
+  LOADED LATENCY (avg):    6.14 us  (all GPUs concurrent)
+  LOADED LATENCY (max):    6.14 us  (worst GPU concurrent)
 ===========================================================
 ```
