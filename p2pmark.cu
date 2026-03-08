@@ -24,17 +24,35 @@ static constexpr int ITERS = 20;
 // Latency mode constants.
 static constexpr size_t LATENCY_SIZE = 128;  // one cacheline
 static constexpr int LATENCY_WORDS = LATENCY_SIZE / sizeof(int);
-static constexpr int LATENCY_WARMUP = 500;
 static constexpr int LATENCY_ITERS = 10000;
 
-// Single-thread kernel that reads `words` ints from a remote GPU pointer.
-// P2P access must be enabled so `remote` (allocated on another GPU) is
-// directly accessible from the launching GPU.
-__global__ void latency_read_kernel(const int* __restrict__ remote, int* local, int words) {
+// Cache-volatile load — bypasses L2 so every read goes over PCIe/NVLink.
+__device__ __forceinline__ int load_cv(const int* addr) {
+  int val;
+  asm volatile("ld.global.cv.s32 %0, [%1];" : "=r"(val) : "l"(addr));
+  return val;
+}
+
+// Single-thread kernel that reads `words` ints from a remote GPU pointer
+// `iters` times using cache-volatile loads, returning elapsed clock cycles
+// via `out_cycles`. P2P access must be enabled so `remote` (allocated on
+// another GPU) is directly accessible from the launching GPU.
+__global__ void latency_read_kernel(const int* __restrict__ remote, int* local,
+                                    int words, int iters, long long* out_cycles) {
+  // Warmup (not timed).
   int sum = 0;
   for (int i = 0; i < words; i++)
-    sum += remote[i];
+    sum += load_cv(remote + i);
+
+  long long t0 = clock64();
+  for (int it = 0; it < iters; it++) {
+    for (int i = 0; i < words; i++)
+      sum += load_cv(remote + i);
+  }
+  long long t1 = clock64();
+
   local[0] = sum;
+  *out_cycles = t1 - t0;
 }
 
 // Measure unidirectional D2D bandwidth from src GPU to dst GPU.
@@ -396,43 +414,49 @@ int main(int argc, char** argv) {
 
 // ---- Latency mode ----
 
-// Measure latency of a single remote read (8KB) from reader GPU reading src_buf
+// Get the SM clock rate in kHz for a given device.
+static double get_clock_rate_khz(int dev) {
+  int clock_khz;
+  CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, dev));
+  return (double)clock_khz;
+}
+
+// Convert clock64() cycle delta to microseconds.
+static double cycles_to_us(long long cycles, double clock_khz) {
+  return (double)cycles / (clock_khz * 1000.0) * 1e6;
+}
+
+// Measure latency of a single remote read from reader GPU reading src_buf
 // on another GPU. Returns average latency in microseconds.
+// `cycles_buf` must be a device pointer to a long long on the reader GPU.
 static double measure_latency(int reader, void* src_buf, void* local_buf,
+                              void* cycles_buf, double clock_khz,
                               cudaStream_t stream) {
-  // Warmup.
-  for (int i = 0; i < LATENCY_WARMUP; i++)
-    latency_read_kernel<<<1, 1, 0, stream>>>((const int*)src_buf, (int*)local_buf, LATENCY_WORDS);
+  latency_read_kernel<<<1, 1, 0, stream>>>(
+      (const int*)src_buf, (int*)local_buf,
+      LATENCY_WORDS, LATENCY_ITERS, (long long*)cycles_buf);
   CHECK(cudaStreamSynchronize(stream));
 
-  cudaEvent_t start, stop;
-  CHECK(cudaEventCreate(&start));
-  CHECK(cudaEventCreate(&stop));
-  CHECK(cudaEventRecord(start, stream));
-  for (int i = 0; i < LATENCY_ITERS; i++)
-    latency_read_kernel<<<1, 1, 0, stream>>>((const int*)src_buf, (int*)local_buf, LATENCY_WORDS);
-  CHECK(cudaEventRecord(stop, stream));
-  CHECK(cudaStreamSynchronize(stream));
-
-  float ms;
-  CHECK(cudaEventElapsedTime(&ms, start, stop));
-  CHECK(cudaEventDestroy(start));
-  CHECK(cudaEventDestroy(stop));
-  return (double)ms * 1000.0 / LATENCY_ITERS;  // microseconds
+  long long cycles;
+  CHECK(cudaMemcpy(&cycles, cycles_buf, sizeof(long long), cudaMemcpyDeviceToHost));
+  return cycles_to_us(cycles, clock_khz) / LATENCY_ITERS / LATENCY_WORDS;
 }
 
 static void run_latency_tests(int ngpu) {
   printf("=== LATENCY MODE (%zu-byte remote reads, %d iterations) ===\n\n", LATENCY_SIZE, LATENCY_ITERS);
 
-  // Allocate one source buffer and one local scratch per GPU.
-  std::vector<void*> bufs(ngpu), local(ngpu);
+  // Allocate one source buffer, local scratch, and cycles buffer per GPU.
+  std::vector<void*> bufs(ngpu), local(ngpu), cycles_buf(ngpu);
   std::vector<cudaStream_t> streams(ngpu);
+  std::vector<double> clock_khz(ngpu);
   for (int i = 0; i < ngpu; i++) {
     CHECK(cudaSetDevice(i));
     CHECK(cudaMalloc(&bufs[i], LATENCY_SIZE));
     CHECK(cudaMemset(bufs[i], i, LATENCY_SIZE));
     CHECK(cudaMalloc(&local[i], sizeof(int)));
+    CHECK(cudaMalloc(&cycles_buf[i], sizeof(long long)));
     CHECK(cudaStreamCreate(&streams[i]));
+    clock_khz[i] = get_clock_rate_khz(i);
   }
 
   // ---- Test 1: Sequential NxN latency ----
@@ -452,7 +476,7 @@ static void run_latency_tests(int ngpu) {
         printf("     -   ");
         continue;
       }
-      double us = measure_latency(r, bufs[s], local[r], streams[r]);
+      double us = measure_latency(r, bufs[s], local[r], cycles_buf[r], clock_khz[r], streams[r]);
       seq_lat[r][s] = us;
       printf("  %6.2f  ", us);
     }
@@ -474,26 +498,6 @@ static void run_latency_tests(int ngpu) {
   for (int r = 0; r < ngpu - 1; r++) {
     int offset = r + 1;
 
-    // Warmup.
-    for (int i = 0; i < ngpu; i++) {
-      int peer = (i + offset) % ngpu;
-      CHECK(cudaSetDevice(i));
-      for (int w = 0; w < LATENCY_WARMUP; w++)
-        latency_read_kernel<<<1, 1, 0, streams[i]>>>((const int*)bufs[peer], (int*)local[i], LATENCY_WORDS);
-    }
-    for (int i = 0; i < ngpu; i++) {
-      CHECK(cudaSetDevice(i));
-      CHECK(cudaStreamSynchronize(streams[i]));
-    }
-
-    // Timed.
-    std::vector<cudaEvent_t> starts(ngpu), stops(ngpu);
-    for (int i = 0; i < ngpu; i++) {
-      CHECK(cudaSetDevice(i));
-      CHECK(cudaEventCreate(&starts[i]));
-      CHECK(cudaEventCreate(&stops[i]));
-    }
-
     std::barrier round_barrier(ngpu);
     std::vector<double> per_gpu_lat(ngpu);
     std::vector<std::thread> round_threads;
@@ -505,15 +509,14 @@ static void run_latency_tests(int ngpu) {
 
         round_barrier.arrive_and_wait();
 
-        CHECK(cudaEventRecord(starts[i], streams[i]));
-        for (int it = 0; it < LATENCY_ITERS; it++)
-          latency_read_kernel<<<1, 1, 0, streams[i]>>>((const int*)bufs[peer], (int*)local[i], LATENCY_WORDS);
-        CHECK(cudaEventRecord(stops[i], streams[i]));
+        latency_read_kernel<<<1, 1, 0, streams[i]>>>(
+            (const int*)bufs[peer], (int*)local[i],
+            LATENCY_WORDS, LATENCY_ITERS, (long long*)cycles_buf[i]);
         CHECK(cudaStreamSynchronize(streams[i]));
 
-        float ms;
-        CHECK(cudaEventElapsedTime(&ms, starts[i], stops[i]));
-        per_gpu_lat[i] = (double)ms * 1000.0 / LATENCY_ITERS;
+        long long cyc;
+        CHECK(cudaMemcpy(&cyc, cycles_buf[i], sizeof(long long), cudaMemcpyDeviceToHost));
+        per_gpu_lat[i] = cycles_to_us(cyc, clock_khz[i]) / LATENCY_ITERS / LATENCY_WORDS;
       });
     }
     for (auto& t : round_threads) t.join();
@@ -527,12 +530,6 @@ static void run_latency_tests(int ngpu) {
       printf("%d<-%d ", i, peer);
     }
     printf(" %6.2f us avg\n", avg);
-
-    for (int i = 0; i < ngpu; i++) {
-      CHECK(cudaSetDevice(i));
-      CHECK(cudaEventDestroy(starts[i]));
-      CHECK(cudaEventDestroy(stops[i]));
-    }
   }
 
   // ---- Test 2b: Single reader, all peers concurrent ----
@@ -543,51 +540,35 @@ static void run_latency_tests(int ngpu) {
   for (int reader = 0; reader < ngpu; reader++) {
     CHECK(cudaSetDevice(reader));
     std::vector<cudaStream_t> peer_streams(ngpu - 1);
-    std::vector<void*> peer_local(ngpu - 1);
+    std::vector<void*> peer_local(ngpu - 1), peer_cycles(ngpu - 1);
     for (int r = 0; r < ngpu - 1; r++) {
       CHECK(cudaStreamCreate(&peer_streams[r]));
       CHECK(cudaMalloc(&peer_local[r], sizeof(int)));
+      CHECK(cudaMalloc(&peer_cycles[r], sizeof(long long)));
     }
 
-    // Warmup.
     for (int r = 0; r < ngpu - 1; r++) {
       int peer = (reader + r + 1) % ngpu;
-      for (int w = 0; w < LATENCY_WARMUP; w++)
-        latency_read_kernel<<<1, 1, 0, peer_streams[r]>>>((const int*)bufs[peer], (int*)peer_local[r], LATENCY_WORDS);
-    }
-    for (int r = 0; r < ngpu - 1; r++)
-      CHECK(cudaStreamSynchronize(peer_streams[r]));
-
-    // Timed: all streams launch concurrently.
-    std::vector<cudaEvent_t> starts(ngpu - 1), stops(ngpu - 1);
-    for (int r = 0; r < ngpu - 1; r++) {
-      CHECK(cudaEventCreate(&starts[r]));
-      CHECK(cudaEventCreate(&stops[r]));
-    }
-    for (int r = 0; r < ngpu - 1; r++) {
-      int peer = (reader + r + 1) % ngpu;
-      CHECK(cudaEventRecord(starts[r], peer_streams[r]));
-      for (int it = 0; it < LATENCY_ITERS; it++)
-        latency_read_kernel<<<1, 1, 0, peer_streams[r]>>>((const int*)bufs[peer], (int*)peer_local[r], LATENCY_WORDS);
-      CHECK(cudaEventRecord(stops[r], peer_streams[r]));
+      latency_read_kernel<<<1, 1, 0, peer_streams[r]>>>(
+          (const int*)bufs[peer], (int*)peer_local[r],
+          LATENCY_WORDS, LATENCY_ITERS, (long long*)peer_cycles[r]);
     }
     for (int r = 0; r < ngpu - 1; r++)
       CHECK(cudaStreamSynchronize(peer_streams[r]));
 
     double max_lat = 0;
     for (int r = 0; r < ngpu - 1; r++) {
-      float ms;
-      CHECK(cudaEventElapsedTime(&ms, starts[r], stops[r]));
-      double us = (double)ms * 1000.0 / LATENCY_ITERS;
+      long long cyc;
+      CHECK(cudaMemcpy(&cyc, peer_cycles[r], sizeof(long long), cudaMemcpyDeviceToHost));
+      double us = cycles_to_us(cyc, clock_khz[reader]) / LATENCY_ITERS / LATENCY_WORDS;
       max_lat = std::max(max_lat, us);
     }
     sr_lat[reader] = max_lat;
     printf("GPU %d: %.2f us (max across %d peers)\n", reader, max_lat, ngpu - 1);
 
     for (int r = 0; r < ngpu - 1; r++) {
-      CHECK(cudaEventDestroy(starts[r]));
-      CHECK(cudaEventDestroy(stops[r]));
       CHECK(cudaFree(peer_local[r]));
+      CHECK(cudaFree(peer_cycles[r]));
       CHECK(cudaStreamDestroy(peer_streams[r]));
     }
   }
@@ -597,33 +578,19 @@ static void run_latency_tests(int ngpu) {
   printf("Each GPU has %d streams, %d total concurrent kernels.\n\n",
          ngpu - 1, ngpu * (ngpu - 1));
 
-  // Allocate per-GPU, per-peer streams and scratch.
+  // Allocate per-GPU, per-peer streams, scratch, and cycle buffers.
   std::vector<std::vector<cudaStream_t>> ac_streams(ngpu, std::vector<cudaStream_t>(ngpu - 1));
   std::vector<std::vector<void*>> ac_local(ngpu, std::vector<void*>(ngpu - 1));
+  std::vector<std::vector<void*>> ac_cycles(ngpu, std::vector<void*>(ngpu - 1));
   for (int i = 0; i < ngpu; i++) {
     CHECK(cudaSetDevice(i));
     for (int r = 0; r < ngpu - 1; r++) {
       CHECK(cudaStreamCreate(&ac_streams[i][r]));
       CHECK(cudaMalloc(&ac_local[i][r], sizeof(int)));
+      CHECK(cudaMalloc(&ac_cycles[i][r], sizeof(long long)));
     }
   }
 
-  // Warmup.
-  for (int i = 0; i < ngpu; i++) {
-    CHECK(cudaSetDevice(i));
-    for (int r = 0; r < ngpu - 1; r++) {
-      int peer = (i + r + 1) % ngpu;
-      for (int w = 0; w < LATENCY_WARMUP; w++)
-        latency_read_kernel<<<1, 1, 0, ac_streams[i][r]>>>((const int*)bufs[peer], (int*)ac_local[i][r], LATENCY_WORDS);
-    }
-  }
-  for (int i = 0; i < ngpu; i++) {
-    CHECK(cudaSetDevice(i));
-    for (int r = 0; r < ngpu - 1; r++)
-      CHECK(cudaStreamSynchronize(ac_streams[i][r]));
-  }
-
-  // Timed.
   std::barrier ac_barrier(ngpu);
   std::vector<double> ac_lat(ngpu);
   std::vector<std::thread> ac_threads;
@@ -634,30 +601,21 @@ static void run_latency_tests(int ngpu) {
 
       ac_barrier.arrive_and_wait();
 
-      // Launch all peer kernels, measure per-stream.
-      std::vector<cudaEvent_t> starts(ngpu - 1), stops(ngpu - 1);
-      for (int r = 0; r < ngpu - 1; r++) {
-        CHECK(cudaEventCreate(&starts[r]));
-        CHECK(cudaEventCreate(&stops[r]));
-      }
       for (int r = 0; r < ngpu - 1; r++) {
         int peer = (i + r + 1) % ngpu;
-        CHECK(cudaEventRecord(starts[r], ac_streams[i][r]));
-        for (int it = 0; it < LATENCY_ITERS; it++)
-          latency_read_kernel<<<1, 1, 0, ac_streams[i][r]>>>((const int*)bufs[peer], (int*)ac_local[i][r], LATENCY_WORDS);
-        CHECK(cudaEventRecord(stops[r], ac_streams[i][r]));
+        latency_read_kernel<<<1, 1, 0, ac_streams[i][r]>>>(
+            (const int*)bufs[peer], (int*)ac_local[i][r],
+            LATENCY_WORDS, LATENCY_ITERS, (long long*)ac_cycles[i][r]);
       }
       for (int r = 0; r < ngpu - 1; r++)
         CHECK(cudaStreamSynchronize(ac_streams[i][r]));
 
       double max_lat = 0;
       for (int r = 0; r < ngpu - 1; r++) {
-        float ms;
-        CHECK(cudaEventElapsedTime(&ms, starts[r], stops[r]));
-        double us = (double)ms * 1000.0 / LATENCY_ITERS;
+        long long cyc;
+        CHECK(cudaMemcpy(&cyc, ac_cycles[i][r], sizeof(long long), cudaMemcpyDeviceToHost));
+        double us = cycles_to_us(cyc, clock_khz[i]) / LATENCY_ITERS / LATENCY_WORDS;
         max_lat = std::max(max_lat, us);
-        CHECK(cudaEventDestroy(starts[r]));
-        CHECK(cudaEventDestroy(stops[r]));
       }
       ac_lat[i] = max_lat;
     });
@@ -694,6 +652,7 @@ static void run_latency_tests(int ngpu) {
     CHECK(cudaSetDevice(i));
     for (int r = 0; r < ngpu - 1; r++) {
       CHECK(cudaFree(ac_local[i][r]));
+      CHECK(cudaFree(ac_cycles[i][r]));
       CHECK(cudaStreamDestroy(ac_streams[i][r]));
     }
   }
@@ -701,6 +660,7 @@ static void run_latency_tests(int ngpu) {
     CHECK(cudaSetDevice(i));
     CHECK(cudaFree(bufs[i]));
     CHECK(cudaFree(local[i]));
+    CHECK(cudaFree(cycles_buf[i]));
     CHECK(cudaStreamDestroy(streams[i]));
   }
 }
