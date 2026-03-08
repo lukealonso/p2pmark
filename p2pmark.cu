@@ -677,10 +677,15 @@ static void run_latency_tests(int ngpu) {
     for (int j = 0; j < ngpu; j++)
       if (i != j) seq_min = std::min(seq_min, seq_lat[i][j]);
 
+  double ac_max = 0;
+  for (int i = 0; i < ngpu; i++)
+    ac_max = std::max(ac_max, ac_lat[i]);
+
   printf("\n");
   printf("===========================================================\n");
   printf("  P2P LATENCY:           %6.2f us  (best pair, isolated)\n", seq_min);
-  printf("  LOADED LATENCY:        %6.2f us  (all GPUs concurrent)\n", ac_avg);
+  printf("  LOADED LATENCY (avg):  %6.2f us  (all GPUs concurrent)\n", ac_avg);
+  printf("  LOADED LATENCY (max):  %6.2f us  (worst GPU concurrent)\n", ac_max);
   printf("===========================================================\n");
 
   // Cleanup.
