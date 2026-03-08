@@ -671,22 +671,16 @@ static void run_latency_tests(int ngpu) {
   }
   ac_avg /= ngpu;
 
-  // Find min and max from sequential NxN.
+  // Find min from sequential NxN.
   double seq_min = 1e9;
   for (int i = 0; i < ngpu; i++)
     for (int j = 0; j < ngpu; j++)
       if (i != j) seq_min = std::min(seq_min, seq_lat[i][j]);
 
-  // Find max from all-concurrent.
-  double ac_max = 0;
-  for (int i = 0; i < ngpu; i++)
-    ac_max = std::max(ac_max, ac_lat[i]);
-
   printf("\n");
   printf("===========================================================\n");
-  printf("  P2P LATENCY (1:1):     %6.2f us  (best pair)\n", seq_min);
-  printf("  LOADED LATENCY (avg):  %6.2f us  (all GPUs concurrent)\n", ac_avg);
-  printf("  LOADED LATENCY (max):  %6.2f us  (worst GPU concurrent)\n", ac_max);
+  printf("  P2P LATENCY:           %6.2f us  (best pair, isolated)\n", seq_min);
+  printf("  LOADED LATENCY:        %6.2f us  (all GPUs concurrent)\n", ac_avg);
   printf("===========================================================\n");
 
   // Cleanup.
