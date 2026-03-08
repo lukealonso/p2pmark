@@ -547,25 +547,39 @@ static void run_latency_tests(int ngpu) {
       CHECK(cudaMalloc(&peer_cycles[r], sizeof(long long)));
     }
 
+    // Warmup.
+    for (int r = 0; r < ngpu - 1; r++) {
+      int peer = (reader + r + 1) % ngpu;
+      latency_read_kernel<<<1, 1, 0, peer_streams[r]>>>(
+          (const int*)bufs[peer], (int*)peer_local[r],
+          LATENCY_WORDS, 1, (long long*)peer_cycles[r]);
+    }
+    for (int r = 0; r < ngpu - 1; r++)
+      CHECK(cudaStreamSynchronize(peer_streams[r]));
+
+    // Timed: wall-clock from first launch to all done.
+    cudaEvent_t ev_start, ev_stop;
+    CHECK(cudaEventCreate(&ev_start));
+    CHECK(cudaEventCreate(&ev_stop));
+    CHECK(cudaEventRecord(ev_start, peer_streams[0]));
     for (int r = 0; r < ngpu - 1; r++) {
       int peer = (reader + r + 1) % ngpu;
       latency_read_kernel<<<1, 1, 0, peer_streams[r]>>>(
           (const int*)bufs[peer], (int*)peer_local[r],
           LATENCY_WORDS, LATENCY_ITERS, (long long*)peer_cycles[r]);
     }
-    for (int r = 0; r < ngpu - 1; r++)
+    for (int r = 1; r < ngpu - 1; r++)
       CHECK(cudaStreamSynchronize(peer_streams[r]));
+    CHECK(cudaEventRecord(ev_stop, peer_streams[0]));
+    CHECK(cudaStreamSynchronize(peer_streams[0]));
 
-    double max_lat = 0;
-    for (int r = 0; r < ngpu - 1; r++) {
-      long long cyc;
-      CHECK(cudaMemcpy(&cyc, peer_cycles[r], sizeof(long long), cudaMemcpyDeviceToHost));
-      double us = cycles_to_us(cyc, clock_khz[reader]) / LATENCY_ITERS / LATENCY_WORDS;
-      max_lat = std::max(max_lat, us);
-    }
-    sr_lat[reader] = max_lat;
-    printf("GPU %d: %.2f us (max across %d peers)\n", reader, max_lat, ngpu - 1);
+    float ms;
+    CHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
+    sr_lat[reader] = (double)ms * 1000.0 / LATENCY_ITERS / LATENCY_WORDS;
+    printf("GPU %d: %.2f us\n", reader, sr_lat[reader]);
 
+    CHECK(cudaEventDestroy(ev_start));
+    CHECK(cudaEventDestroy(ev_stop));
     for (int r = 0; r < ngpu - 1; r++) {
       CHECK(cudaFree(peer_local[r]));
       CHECK(cudaFree(peer_cycles[r]));
@@ -591,6 +605,23 @@ static void run_latency_tests(int ngpu) {
     }
   }
 
+  // Warmup.
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    for (int r = 0; r < ngpu - 1; r++) {
+      int peer = (i + r + 1) % ngpu;
+      latency_read_kernel<<<1, 1, 0, ac_streams[i][r]>>>(
+          (const int*)bufs[peer], (int*)ac_local[i][r],
+          LATENCY_WORDS, 1, (long long*)ac_cycles[i][r]);
+    }
+  }
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    for (int r = 0; r < ngpu - 1; r++)
+      CHECK(cudaStreamSynchronize(ac_streams[i][r]));
+  }
+
+  // Timed: wall-clock per GPU via cudaEvent.
   std::barrier ac_barrier(ngpu);
   std::vector<double> ac_lat(ngpu);
   std::vector<std::thread> ac_threads;
@@ -599,25 +630,30 @@ static void run_latency_tests(int ngpu) {
     ac_threads.emplace_back([&, i]() {
       CHECK(cudaSetDevice(i));
 
+      cudaEvent_t ev_start, ev_stop;
+      CHECK(cudaEventCreate(&ev_start));
+      CHECK(cudaEventCreate(&ev_stop));
+
       ac_barrier.arrive_and_wait();
 
+      CHECK(cudaEventRecord(ev_start, ac_streams[i][0]));
       for (int r = 0; r < ngpu - 1; r++) {
         int peer = (i + r + 1) % ngpu;
         latency_read_kernel<<<1, 1, 0, ac_streams[i][r]>>>(
             (const int*)bufs[peer], (int*)ac_local[i][r],
             LATENCY_WORDS, LATENCY_ITERS, (long long*)ac_cycles[i][r]);
       }
-      for (int r = 0; r < ngpu - 1; r++)
+      for (int r = 1; r < ngpu - 1; r++)
         CHECK(cudaStreamSynchronize(ac_streams[i][r]));
+      CHECK(cudaEventRecord(ev_stop, ac_streams[i][0]));
+      CHECK(cudaStreamSynchronize(ac_streams[i][0]));
 
-      double max_lat = 0;
-      for (int r = 0; r < ngpu - 1; r++) {
-        long long cyc;
-        CHECK(cudaMemcpy(&cyc, ac_cycles[i][r], sizeof(long long), cudaMemcpyDeviceToHost));
-        double us = cycles_to_us(cyc, clock_khz[i]) / LATENCY_ITERS / LATENCY_WORDS;
-        max_lat = std::max(max_lat, us);
-      }
-      ac_lat[i] = max_lat;
+      float ms;
+      CHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
+      ac_lat[i] = (double)ms * 1000.0 / LATENCY_ITERS / LATENCY_WORDS;
+
+      CHECK(cudaEventDestroy(ev_start));
+      CHECK(cudaEventDestroy(ev_stop));
     });
   }
   for (auto& t : ac_threads) t.join();
