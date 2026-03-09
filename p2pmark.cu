@@ -47,16 +47,16 @@ using FlagType = uint32_t;
 constexpr int kFlagStride = 32;
 
 struct Signal {
-  alignas(128) FlagType self_counter[kMaxBlocks][16];
+  alignas(128) FlagType self_counter[kMaxBlocks][8];
   alignas(128) FlagType peer_counter[2][kMaxBlocks][16 * kFlagStride];
 };
 
 struct __align__(16) RankData {
-  const void* __restrict__ ptrs[16];
+  const void* __restrict__ ptrs[8];
 };
 
 struct __align__(16) RankSignals {
-  Signal* signals[16];
+  Signal* signals[8];
 };
 
 template <typename T, int sz>
@@ -179,14 +179,6 @@ static void launch_kernel(int ngpus, int blocks, int threads, cudaStream_t strea
     case 6: KL(6); break;
     case 7: KL(7); break;
     case 8: KL(8); break;
-    case 9: KL(9); break;
-    case 10: KL(10); break;
-    case 11: KL(11); break;
-    case 12: KL(12); break;
-    case 13: KL(13); break;
-    case 14: KL(14); break;
-    case 15: KL(15); break;
-    case 16: KL(16); break;
   }
 #undef KL
 }
@@ -269,6 +261,11 @@ int main(int argc, char** argv) {
   int ngpu;
   CHECK(cudaGetDeviceCount(&ngpu));
   printf("Found %d GPUs\n\n", ngpu);
+
+  if (ngpu > 8) {
+    printf("Clamping to 8 GPUs (P2P hardware limit)\n\n");
+    ngpu = 8;
+  }
 
   // Enable P2P access between all pairs.
   for (int i = 0; i < ngpu; i++) {
@@ -1020,8 +1017,8 @@ static void run_allreduce_tests(int ngpu) {
   using T = half;
   constexpr int d = pcie_ar::packed_t<T>::P::size;
 
-  if (ngpu < 2 || ngpu > 16) {
-    fprintf(stderr, "Allreduce mode requires 2-16 GPUs, got %d\n", ngpu);
+  if (ngpu < 2 || ngpu > 8) {
+    fprintf(stderr, "Allreduce mode requires 2-8 GPUs, got %d\n", ngpu);
     return;
   }
 
