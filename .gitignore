@@ -1,1 +1,8 @@
-./p2pmark
+p2pmark
+.claude/
+xgmi_alloc
+xgmi_match
+xgmi_probe
+xgmi_probe2
+xgmi_size
+

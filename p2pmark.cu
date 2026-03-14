@@ -29,9 +29,10 @@
   } while (0)
 
 // Bandwidth mode constants.
-static constexpr size_t TRANSFER_SIZE = 64 * 1024 * 1024;  // 64 MB
+static constexpr int NVIDIA_NUM_ELEMS = 40000000;  // NVIDIA's default: 40M ints
+static constexpr size_t TRANSFER_SIZE = (size_t)NVIDIA_NUM_ELEMS * sizeof(int);  // 160,000,000 bytes
 static constexpr int WARMUP = 5;
-static constexpr int ITERS = 20;
+static constexpr int ITERS = 5;
 
 // Latency mode constants.
 static constexpr size_t LATENCY_SIZE = 128;  // one cacheline
@@ -187,6 +188,16 @@ static void launch_kernel(int ngpus, int blocks, int threads, cudaStream_t strea
 
 }  // namespace pcie_ar
 
+// NVIDIA's delay kernel — blocks stream until flag is set, ensuring all
+// subsequent copies are queued before the GPU starts processing them.
+// This eliminates CPU-side API overhead gaps in the DMA pipeline.
+__global__ void delay_kernel(volatile int *flag, unsigned long long timeout_clocks = 200000000) {
+  long long int start_clock = clock64();
+  while (!*flag) {
+    if (clock64() - start_clock > timeout_clocks) break;
+  }
+}
+
 // Cache-volatile load — bypasses L2 so every read goes over PCIe/NVLink.
 __device__ __forceinline__ int load_cv(const int* addr) {
   int val;
@@ -216,7 +227,9 @@ __global__ void latency_read_kernel(const int* __restrict__ remote, int* local,
   *out_cycles = t1 - t0;
 }
 
-// Measure unidirectional D2D bandwidth from src GPU to dst GPU.
+// Measure unidirectional D2D write bandwidth from src GPU to dst GPU.
+// Uses cudaEvent timing to exclude CPU-side API overhead, which is
+// significant for cross-socket (xGMI) transfers.
 double measure_bw(int src, int dst, size_t bytes, cudaStream_t stream) {
   void *src_buf, *dst_buf;
   CHECK(cudaSetDevice(src));
@@ -230,15 +243,22 @@ double measure_bw(int src, int dst, size_t bytes, cudaStream_t stream) {
     CHECK(cudaMemcpyPeerAsync(dst_buf, dst, src_buf, src, bytes, stream));
   CHECK(cudaStreamSynchronize(stream));
 
-  auto t0 = std::chrono::high_resolution_clock::now();
+  cudaEvent_t e0, e1;
+  CHECK(cudaEventCreate(&e0));
+  CHECK(cudaEventCreate(&e1));
+
+  CHECK(cudaEventRecord(e0, stream));
   for (int i = 0; i < ITERS; i++)
     CHECK(cudaMemcpyPeerAsync(dst_buf, dst, src_buf, src, bytes, stream));
+  CHECK(cudaEventRecord(e1, stream));
   CHECK(cudaStreamSynchronize(stream));
-  auto t1 = std::chrono::high_resolution_clock::now();
 
-  double sec = std::chrono::duration<double>(t1 - t0).count();
-  double gbps = (double)bytes * ITERS / sec / 1e9;
+  float ms;
+  CHECK(cudaEventElapsedTime(&ms, e0, e1));
+  double gbps = (double)bytes * ITERS / (ms / 1000.0) / 1e9;
 
+  CHECK(cudaEventDestroy(e0));
+  CHECK(cudaEventDestroy(e1));
   CHECK(cudaSetDevice(src));
   CHECK(cudaFree(src_buf));
   CHECK(cudaSetDevice(dst));
@@ -267,31 +287,58 @@ int main(int argc, char** argv) {
     ngpu = 8;
   }
 
-  // Enable P2P access between all pairs.
-  for (int i = 0; i < ngpu; i++) {
-    CHECK(cudaSetDevice(i));
-    for (int j = 0; j < ngpu; j++) {
-      if (i == j) continue;
-      int can;
-      CHECK(cudaDeviceCanAccessPeer(&can, i, j));
-      if (can) {
-        cudaDeviceEnablePeerAccess(j, 0);  // ignore already-enabled error
+  auto enable_all_peer_access = [&]() {
+    for (int i = 0; i < ngpu; i++) {
+      CHECK(cudaSetDevice(i));
+      for (int j = 0; j < ngpu; j++) {
+        if (i == j) continue;
+        int can;
+        CHECK(cudaDeviceCanAccessPeer(&can, i, j));
+        if (can) {
+          cudaDeviceEnablePeerAccess(j, 0);  // ignore already-enabled error
+        }
       }
     }
-  }
+  };
 
   if (latency_mode) {
+    enable_all_peer_access();
     run_latency_tests(ngpu);
     return 0;
   }
   if (allreduce_mode) {
+    enable_all_peer_access();
     run_allreduce_tests(ngpu);
     return 0;
   }
 
   // ---- Test 1: Sequential NxN ----
+  // Pre-allocate all buffers (like NVIDIA's test) to avoid allocator
+  // address churn that can affect cross-socket xGMI routing.
   printf("=== Sequential P2P bandwidth (GB/s) ===\n");
   printf("Each transfer: %zu MB, %d iterations\n\n", TRANSFER_SIZE / (1024 * 1024), ITERS);
+
+  // Allocate buffers on ALL GPUs BEFORE enabling peer access.
+  // This order matches NVIDIA's p2pBandwidthLatencyTest and produces
+  // optimal cross-socket xGMI bandwidth.
+  std::vector<void*> seq_bufs(ngpu);
+  std::vector<cudaStream_t> seq_streams(ngpu);
+  std::vector<cudaEvent_t> seq_starts(ngpu), seq_stops(ngpu);
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaStreamCreateWithFlags(&seq_streams[i], cudaStreamNonBlocking));
+    CHECK(cudaMalloc(&seq_bufs[i], TRANSFER_SIZE));
+    CHECK(cudaMemset(seq_bufs[i], 0, TRANSFER_SIZE));
+    CHECK(cudaEventCreate(&seq_starts[i]));
+    CHECK(cudaEventCreate(&seq_stops[i]));
+  }
+
+  // Enable P2P access AFTER allocation (critical for xGMI bandwidth).
+  enable_all_peer_access();
+
+  // Host-pinned flag for delay kernel synchronization.
+  volatile int *delay_flag;
+  CHECK(cudaHostAlloc((void**)&delay_flag, sizeof(*delay_flag), cudaHostAllocPortable));
 
   std::vector<std::vector<double>> seq_bw(ngpu, std::vector<double>(ngpu, 0.0));
 
@@ -302,32 +349,54 @@ int main(int argc, char** argv) {
   for (int s = 0; s < ngpu; s++) {
     printf("GPU %d:", s);
     CHECK(cudaSetDevice(s));
-    cudaStream_t stream;
-    CHECK(cudaStreamCreate(&stream));
     for (int d = 0; d < ngpu; d++) {
       if (s == d) {
         printf("     -   ");
         continue;
       }
-      double bw = measure_bw(s, d, TRANSFER_SIZE, stream);
+      // Timed — delay kernel pre-queues all copies (NVIDIA approach).
+      CHECK(cudaStreamSynchronize(seq_streams[s]));
+      *delay_flag = 0;
+      delay_kernel<<<1, 1, 0, seq_streams[s]>>>(delay_flag);
+      CHECK(cudaEventRecord(seq_starts[s], seq_streams[s]));
+      for (int it = 0; it < ITERS; it++)
+        CHECK(cudaMemcpyPeerAsync(seq_bufs[d], d, seq_bufs[s], s,
+                                  TRANSFER_SIZE, seq_streams[s]));
+      CHECK(cudaEventRecord(seq_stops[s], seq_streams[s]));
+      *delay_flag = 1;
+      CHECK(cudaStreamSynchronize(seq_streams[s]));
+
+      float ms;
+      CHECK(cudaEventElapsedTime(&ms, seq_starts[s], seq_stops[s]));
+      double bw = (double)TRANSFER_SIZE * ITERS / (ms / 1000.0) / 1e9;
       seq_bw[s][d] = bw;
       printf("  %6.2f  ", bw);
     }
     printf("\n");
-    CHECK(cudaStreamDestroy(stream));
   }
 
-  // ---- Test 2: Staggered circular reads (allreduce pattern) ----
-  // N-1 rounds. In round r, every GPU i reads from GPU (i+r+1)%N.
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaFree(seq_bufs[i]));
+    CHECK(cudaEventDestroy(seq_starts[i]));
+    CHECK(cudaEventDestroy(seq_stops[i]));
+    CHECK(cudaStreamDestroy(seq_streams[i]));
+  }
+  CHECK(cudaFreeHost((void*)delay_flag));
+
+  // ---- Test 2: Staggered circular writes (allreduce pattern) ----
+  // N-1 rounds. In round r, every GPU i writes to GPU (i+r+1)%N.
   // This is the access pattern used by the PCIe allreduce kernel to
   // spread traffic across the switch fabric.
-  printf("\n=== Topology probe: staggered reads by peer distance (GB/s) ===\n");
-  printf("%d concurrent transfers per round, each GPU reading from one unique peer.\n", ngpu);
+  printf("\n=== Topology probe: staggered writes by peer distance (GB/s) ===\n");
+  printf("%d concurrent transfers per round, each GPU writing to one unique peer.\n", ngpu);
   printf("Reveals PCIe switch topology: nearby peers are fast, cross-switch peers are slow.\n\n");
 
   std::vector<void*> stag_bufs(ngpu);
   std::vector<void*> stag_dst(ngpu);
   std::vector<cudaStream_t> stag_streams(ngpu);
+  volatile int *stag_flag;
+  CHECK(cudaHostAlloc((void**)&stag_flag, sizeof(*stag_flag), cudaHostAllocPortable));
   for (int i = 0; i < ngpu; i++) {
     CHECK(cudaSetDevice(i));
     CHECK(cudaMalloc(&stag_bufs[i], TRANSFER_SIZE));
@@ -343,7 +412,7 @@ int main(int argc, char** argv) {
       int peer = (i + offset) % ngpu;
       CHECK(cudaSetDevice(i));
       for (int w = 0; w < WARMUP; w++)
-        CHECK(cudaMemcpyPeerAsync(stag_dst[i], i, stag_bufs[peer], peer,
+        CHECK(cudaMemcpyPeerAsync(stag_dst[peer], peer, stag_bufs[i], i,
                                   TRANSFER_SIZE, stag_streams[i]));
     }
     for (int i = 0; i < ngpu; i++) {
@@ -351,8 +420,7 @@ int main(int argc, char** argv) {
       CHECK(cudaStreamSynchronize(stag_streams[i]));
     }
 
-    // Timed: all GPUs launch simultaneously via events.
-    // Record start events.
+    // Timed: all GPUs launch simultaneously via delay kernel + barrier.
     std::vector<cudaEvent_t> starts(ngpu), stops(ngpu);
     for (int i = 0; i < ngpu; i++) {
       CHECK(cudaSetDevice(i));
@@ -360,23 +428,28 @@ int main(int argc, char** argv) {
       CHECK(cudaEventCreate(&stops[i]));
     }
 
-    // Use a CPU barrier to get all streams launching close together.
     std::barrier round_barrier(ngpu);
     std::vector<double> per_gpu_bw(ngpu);
 
+    // Pre-queue all copies behind delay kernels on all GPUs.
+    *stag_flag = 0;
+    for (int i = 0; i < ngpu; i++) {
+      int peer = (i + offset) % ngpu;
+      CHECK(cudaSetDevice(i));
+      delay_kernel<<<1, 1, 0, stag_streams[i]>>>(stag_flag);
+      CHECK(cudaEventRecord(starts[i], stag_streams[i]));
+      for (int it = 0; it < ITERS; it++)
+        CHECK(cudaMemcpyPeerAsync(stag_dst[peer], peer, stag_bufs[i], i,
+                                  TRANSFER_SIZE, stag_streams[i]));
+      CHECK(cudaEventRecord(stops[i], stag_streams[i]));
+    }
+    // Release all GPUs simultaneously.
+    *stag_flag = 1;
+
     std::vector<std::thread> round_threads;
     for (int i = 0; i < ngpu; i++) {
-      round_threads.emplace_back([&, i, offset]() {
-        int peer = (i + offset) % ngpu;
+      round_threads.emplace_back([&, i]() {
         CHECK(cudaSetDevice(i));
-
-        round_barrier.arrive_and_wait();
-
-        CHECK(cudaEventRecord(starts[i], stag_streams[i]));
-        for (int it = 0; it < ITERS; it++)
-          CHECK(cudaMemcpyPeerAsync(stag_dst[i], i, stag_bufs[peer], peer,
-                                    TRANSFER_SIZE, stag_streams[i]));
-        CHECK(cudaEventRecord(stops[i], stag_streams[i]));
         CHECK(cudaStreamSynchronize(stag_streams[i]));
 
         float ms;
@@ -391,7 +464,7 @@ int main(int argc, char** argv) {
     printf("+%d  ", offset);
     for (int i = 0; i < ngpu; i++) {
       int peer = (i + offset) % ngpu;
-      printf("%d<-%d ", i, peer);
+      printf("%d->%d ", i, peer);
     }
     printf(" %6.2f avg  %7.2f total\n", total / ngpu, total);
 
@@ -408,101 +481,207 @@ int main(int argc, char** argv) {
     CHECK(cudaFree(stag_dst[i]));
     CHECK(cudaStreamDestroy(stag_streams[i]));
   }
+  CHECK(cudaFreeHost((void*)stag_flag));
 
-  // ---- Test 2b: Single reader, all peers concurrent ----
-  // One GPU reads from all N-1 peers at once (N-1 streams), no other
-  // GPUs active. Shows the max inbound bandwidth per GPU without
-  // cross-traffic from other readers.
-  printf("\n=== Single reader, all %d peers concurrent (GB/s) ===\n\n", ngpu - 1);
+  // ---- Test 2b: Single GPU writes to all peers concurrent ----
+  // One GPU pushes to all N-1 peers at once (N-1 streams), no other
+  // GPUs active. Shows the max outbound bandwidth per GPU without
+  // cross-traffic.
+  printf("\n=== Single GPU writes to all %d peers concurrent (GB/s) ===\n\n", ngpu - 1);
 
-  std::vector<void*> sr_bufs(ngpu);
+  // Allocate destination buffers on each peer GPU.
+  std::vector<std::vector<void*>> sw_dst(ngpu, std::vector<void*>(ngpu - 1));
+  std::vector<void*> sw_src(ngpu);
   for (int i = 0; i < ngpu; i++) {
     CHECK(cudaSetDevice(i));
-    CHECK(cudaMalloc(&sr_bufs[i], TRANSFER_SIZE));
-    CHECK(cudaMemset(sr_bufs[i], i, TRANSFER_SIZE));
+    CHECK(cudaMalloc(&sw_src[i], TRANSFER_SIZE));
+    CHECK(cudaMemset(sw_src[i], i, TRANSFER_SIZE));
+    for (int r = 0; r < ngpu - 1; r++) {
+      int peer = (i + r + 1) % ngpu;
+      CHECK(cudaSetDevice(peer));
+      CHECK(cudaMalloc(&sw_dst[i][r], TRANSFER_SIZE));
+    }
   }
 
-  auto sr_wall_t0 = std::chrono::high_resolution_clock::now();
-  double sr_total_bytes = 0;
-  std::vector<double> sr_bw(ngpu);
+  std::vector<double> sw_bw(ngpu);
+  volatile int *sw_flag;
+  CHECK(cudaHostAlloc((void**)&sw_flag, sizeof(*sw_flag), cudaHostAllocPortable));
 
-  for (int reader = 0; reader < ngpu; reader++) {
-    CHECK(cudaSetDevice(reader));
-    std::vector<void*> dst(ngpu - 1);
+  for (int writer = 0; writer < ngpu; writer++) {
+    CHECK(cudaSetDevice(writer));
     std::vector<cudaStream_t> streams(ngpu - 1);
-    std::vector<int> peers(ngpu - 1);
-    for (int r = 0; r < ngpu - 1; r++) {
-      peers[r] = (reader + r + 1) % ngpu;
-      CHECK(cudaMalloc(&dst[r], TRANSFER_SIZE));
+    for (int r = 0; r < ngpu - 1; r++)
       CHECK(cudaStreamCreate(&streams[r]));
-    }
 
     // Warmup.
     for (int r = 0; r < ngpu - 1; r++) {
+      int peer = (writer + r + 1) % ngpu;
       for (int w = 0; w < WARMUP; w++)
-        CHECK(cudaMemcpyPeerAsync(dst[r], reader, sr_bufs[peers[r]], peers[r],
+        CHECK(cudaMemcpyPeerAsync(sw_dst[writer][r], peer, sw_src[writer], writer,
                                   TRANSFER_SIZE, streams[r]));
     }
     for (int r = 0; r < ngpu - 1; r++)
       CHECK(cudaStreamSynchronize(streams[r]));
 
-    // Timed.
-    auto t0 = std::chrono::high_resolution_clock::now();
+    // Timed — delay kernel pre-queues all copies across all streams.
+    cudaEvent_t ev_start, ev_stop;
+    CHECK(cudaEventCreate(&ev_start));
+    CHECK(cudaEventCreate(&ev_stop));
+
+    *sw_flag = 0;
+    delay_kernel<<<1, 1, 0, streams[0]>>>(sw_flag);
+    CHECK(cudaEventRecord(ev_start, streams[0]));
+    for (int r = 1; r < ngpu - 1; r++)
+      CHECK(cudaStreamWaitEvent(streams[r], ev_start, 0));
+
     for (int it = 0; it < ITERS; it++) {
-      for (int r = 0; r < ngpu - 1; r++)
-        CHECK(cudaMemcpyPeerAsync(dst[r], reader, sr_bufs[peers[r]], peers[r],
+      for (int r = 0; r < ngpu - 1; r++) {
+        int peer = (writer + r + 1) % ngpu;
+        CHECK(cudaMemcpyPeerAsync(sw_dst[writer][r], peer, sw_src[writer], writer,
                                   TRANSFER_SIZE, streams[r]));
+      }
     }
-    for (int r = 0; r < ngpu - 1; r++)
-      CHECK(cudaStreamSynchronize(streams[r]));
-    auto t1 = std::chrono::high_resolution_clock::now();
 
-    double sec = std::chrono::duration<double>(t1 - t0).count();
+    for (int r = 1; r < ngpu - 1; r++) {
+      cudaEvent_t done;
+      CHECK(cudaEventCreate(&done));
+      CHECK(cudaEventRecord(done, streams[r]));
+      CHECK(cudaStreamWaitEvent(streams[0], done, 0));
+      CHECK(cudaEventDestroy(done));
+    }
+    CHECK(cudaEventRecord(ev_stop, streams[0]));
+    *sw_flag = 1;
+    CHECK(cudaStreamSynchronize(streams[0]));
+
+    float ms;
+    CHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
     double bytes = (double)(ngpu - 1) * TRANSFER_SIZE * ITERS;
-    double gbps = bytes / sec / 1e9;
+    sw_bw[writer] = bytes / (ms / 1000.0) / 1e9;
+    printf("GPU %d writes to all peers: %.2f GB/s\n", writer, sw_bw[writer]);
 
-    sr_bw[reader] = gbps;
-    printf("GPU %d reads from all peers: %.2f GB/s\n", reader, gbps);
-    sr_total_bytes += bytes;
-
-    for (int r = 0; r < ngpu - 1; r++) {
-      CHECK(cudaFree(dst[r]));
+    CHECK(cudaEventDestroy(ev_start));
+    CHECK(cudaEventDestroy(ev_stop));
+    for (int r = 0; r < ngpu - 1; r++)
       CHECK(cudaStreamDestroy(streams[r]));
-    }
   }
 
-  auto sr_wall_t1 = std::chrono::high_resolution_clock::now();
-  double sr_wall_sec = std::chrono::duration<double>(sr_wall_t1 - sr_wall_t0).count();
-  printf("\nEffective system bandwidth (sequential): %.2f GB/s\n",
-         sr_total_bytes / sr_wall_sec / 1e9);
+  // ---- Test 2c: Ring bandwidth (allreduce pattern) ----
+  // Each GPU writes only to GPU (i+1)%N — exactly N concurrent flows.
+  // This matches real collective communication patterns (e.g., allreduce ring).
+  printf("\n=== Ring bandwidth: each GPU writes to next neighbor (GB/s) ===\n");
+  printf("%d concurrent transfers (one per GPU), matching allreduce ring pattern.\n\n", ngpu);
 
+  static constexpr int RING_ITERS = 100;
+  static constexpr int RING_WARMUP = 20;
+
+  // Allocate ring buffers: each GPU has one src and one dst.
+  std::vector<void*> ring_src(ngpu), ring_dst(ngpu);
+  std::vector<cudaStream_t> ring_streams(ngpu);
   for (int i = 0; i < ngpu; i++) {
     CHECK(cudaSetDevice(i));
-    CHECK(cudaFree(sr_bufs[i]));
+    CHECK(cudaMalloc(&ring_src[i], TRANSFER_SIZE));
+    CHECK(cudaMemset(ring_src[i], i, TRANSFER_SIZE));
+    CHECK(cudaMalloc(&ring_dst[i], TRANSFER_SIZE));
+    CHECK(cudaStreamCreate(&ring_streams[i]));
   }
 
-  // ---- Test 3: All GPUs read from all peers simultaneously ----
-  // Same as test 2b but all 8 GPUs go at once. One thread per GPU,
-  // N-1 streams each, all timed together.
-  printf("\n=== All GPUs read all peers simultaneously (GB/s) ===\n");
-  printf("Each GPU has %d streams, %d total concurrent transfers.\n\n",
+  // Warmup.
+  for (int i = 0; i < ngpu; i++) {
+    int peer = (i + 1) % ngpu;
+    CHECK(cudaSetDevice(i));
+    for (int w = 0; w < RING_WARMUP; w++)
+      CHECK(cudaMemcpyPeerAsync(ring_dst[peer], peer, ring_src[i], i,
+                                TRANSFER_SIZE, ring_streams[i]));
+  }
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaStreamSynchronize(ring_streams[i]));
+  }
+
+  volatile int *ring_flag;
+  CHECK(cudaHostAlloc((void**)&ring_flag, sizeof(*ring_flag), cudaHostAllocPortable));
+
+  std::vector<double> ring_bw(ngpu);
+  std::vector<cudaEvent_t> ring_starts(ngpu), ring_stops(ngpu);
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaEventCreate(&ring_starts[i]));
+    CHECK(cudaEventCreate(&ring_stops[i]));
+  }
+
+  // Pre-queue all copies behind delay kernels from parallel threads.
+  *ring_flag = 0;
+  {
+    std::barrier ring_queue_barrier(ngpu + 1);
+    std::vector<std::thread> ring_queue_threads;
+    for (int i = 0; i < ngpu; i++) {
+      ring_queue_threads.emplace_back([&, i]() {
+        int peer = (i + 1) % ngpu;
+        CHECK(cudaSetDevice(i));
+        delay_kernel<<<1, 1, 0, ring_streams[i]>>>(ring_flag);
+        CHECK(cudaEventRecord(ring_starts[i], ring_streams[i]));
+        for (int it = 0; it < RING_ITERS; it++)
+          CHECK(cudaMemcpyPeerAsync(ring_dst[peer], peer, ring_src[i], i,
+                                    TRANSFER_SIZE, ring_streams[i]));
+        CHECK(cudaEventRecord(ring_stops[i], ring_streams[i]));
+        ring_queue_barrier.arrive_and_wait();
+      });
+    }
+    ring_queue_barrier.arrive_and_wait();
+    *ring_flag = 1;
+    for (auto& t : ring_queue_threads) t.join();
+  }
+
+  // Collect results.
+  std::vector<std::thread> ring_threads;
+  for (int i = 0; i < ngpu; i++) {
+    ring_threads.emplace_back([&, i]() {
+      CHECK(cudaSetDevice(i));
+      CHECK(cudaStreamSynchronize(ring_streams[i]));
+      float ms;
+      CHECK(cudaEventElapsedTime(&ms, ring_starts[i], ring_stops[i]));
+      ring_bw[i] = (double)TRANSFER_SIZE * RING_ITERS / (ms / 1000.0) / 1e9;
+    });
+  }
+  for (auto& t : ring_threads) t.join();
+
+  double total_ring = 0;
+  for (int i = 0; i < ngpu; i++) {
+    int peer = (i + 1) % ngpu;
+    printf("GPU %d -> GPU %d: %.2f GB/s\n", i, peer, ring_bw[i]);
+    total_ring += ring_bw[i];
+  }
+  printf("\nTotal ring bandwidth: %.2f GB/s  (%.2f GB/s avg per GPU)\n",
+         total_ring, total_ring / ngpu);
+
+  // Cleanup ring resources.
+  CHECK(cudaFreeHost((void*)ring_flag));
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaEventDestroy(ring_starts[i]));
+    CHECK(cudaEventDestroy(ring_stops[i]));
+    CHECK(cudaFree(ring_src[i]));
+    CHECK(cudaFree(ring_dst[i]));
+    CHECK(cudaStreamDestroy(ring_streams[i]));
+  }
+
+  // ---- Test 3: All GPUs write to all peers simultaneously ----
+  // Every GPU pushes to all N-1 peers at once — N*(N-1) concurrent flows.
+  // This is a worst-case fabric stress test, NOT a realistic workload.
+  // Real collectives (e.g., allreduce ring) use only 2*N flows.
+  printf("\n=== All-to-all fabric stress test (GB/s) ===\n");
+  printf("Each GPU has %d streams, %d total concurrent transfers [N*(N-1) worst-case].\n\n",
          ngpu - 1, ngpu * (ngpu - 1));
 
   static constexpr int FC_ITERS = 100;
   static constexpr int FC_WARMUP = 20;
 
-  std::vector<void*> fc_bufs(ngpu);
-  std::vector<std::vector<void*>> fc_dst(ngpu, std::vector<void*>(ngpu - 1));
+  // Re-use sw_src and sw_dst from test 2b.
   std::vector<std::vector<cudaStream_t>> fc_streams(ngpu, std::vector<cudaStream_t>(ngpu - 1));
-
   for (int i = 0; i < ngpu; i++) {
     CHECK(cudaSetDevice(i));
-    CHECK(cudaMalloc(&fc_bufs[i], TRANSFER_SIZE));
-    CHECK(cudaMemset(fc_bufs[i], i, TRANSFER_SIZE));
-    for (int r = 0; r < ngpu - 1; r++) {
-      CHECK(cudaMalloc(&fc_dst[i][r], TRANSFER_SIZE));
+    for (int r = 0; r < ngpu - 1; r++)
       CHECK(cudaStreamCreate(&fc_streams[i][r]));
-    }
   }
 
   // Warmup.
@@ -511,7 +690,7 @@ int main(int argc, char** argv) {
     for (int r = 0; r < ngpu - 1; r++) {
       int peer = (i + r + 1) % ngpu;
       for (int w = 0; w < FC_WARMUP; w++)
-        CHECK(cudaMemcpyPeerAsync(fc_dst[i][r], i, fc_bufs[peer], peer,
+        CHECK(cudaMemcpyPeerAsync(sw_dst[i][r], peer, sw_src[i], i,
                                   TRANSFER_SIZE, fc_streams[i][r]));
     }
   }
@@ -521,31 +700,68 @@ int main(int argc, char** argv) {
       CHECK(cudaStreamSynchronize(fc_streams[i][r]));
   }
 
-  std::barrier fc_barrier(ngpu);
-  std::vector<double> fc_bw(ngpu);
-  std::vector<std::thread> fc_threads;
+  volatile int *fc_flag;
+  CHECK(cudaHostAlloc((void**)&fc_flag, sizeof(*fc_flag), cudaHostAllocPortable));
 
+  std::vector<double> fc_bw(ngpu);
+
+  std::vector<cudaEvent_t> fc_starts(ngpu), fc_stops(ngpu);
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaEventCreate(&fc_starts[i]));
+    CHECK(cudaEventCreate(&fc_stops[i]));
+  }
+
+  // Pre-queue all copies on all GPUs behind delay kernels from parallel threads.
+  *fc_flag = 0;
+  {
+    std::barrier fc_queue_barrier(ngpu + 1);  // ngpu threads + main thread
+    std::vector<std::thread> queue_threads;
+    for (int i = 0; i < ngpu; i++) {
+      queue_threads.emplace_back([&, i]() {
+        CHECK(cudaSetDevice(i));
+        delay_kernel<<<1, 1, 0, fc_streams[i][0]>>>(fc_flag);
+        CHECK(cudaEventRecord(fc_starts[i], fc_streams[i][0]));
+        for (int r = 1; r < ngpu - 1; r++)
+          CHECK(cudaStreamWaitEvent(fc_streams[i][r], fc_starts[i], 0));
+
+        for (int it = 0; it < FC_ITERS; it++) {
+          for (int r = 0; r < ngpu - 1; r++) {
+            int peer = (i + r + 1) % ngpu;
+            CHECK(cudaMemcpyPeerAsync(sw_dst[i][r], peer, sw_src[i], i,
+                                      TRANSFER_SIZE, fc_streams[i][r]));
+          }
+        }
+
+        for (int r = 1; r < ngpu - 1; r++) {
+          cudaEvent_t done;
+          CHECK(cudaEventCreate(&done));
+          CHECK(cudaEventRecord(done, fc_streams[i][r]));
+          CHECK(cudaStreamWaitEvent(fc_streams[i][0], done, 0));
+          CHECK(cudaEventDestroy(done));
+        }
+        CHECK(cudaEventRecord(fc_stops[i], fc_streams[i][0]));
+
+        // Wait for all threads to finish queuing before releasing.
+        fc_queue_barrier.arrive_and_wait();
+      });
+    }
+    // Main thread waits for all queuing to complete, then releases.
+    fc_queue_barrier.arrive_and_wait();
+    *fc_flag = 1;
+    for (auto& t : queue_threads) t.join();
+  }
+
+  std::vector<std::thread> fc_threads;
   for (int i = 0; i < ngpu; i++) {
     fc_threads.emplace_back([&, i]() {
       CHECK(cudaSetDevice(i));
+      CHECK(cudaStreamSynchronize(fc_streams[i][0]));
 
-      fc_barrier.arrive_and_wait();
-
-      auto t0 = std::chrono::high_resolution_clock::now();
-      for (int it = 0; it < FC_ITERS; it++) {
-        for (int r = 0; r < ngpu - 1; r++) {
-          int peer = (i + r + 1) % ngpu;
-          CHECK(cudaMemcpyPeerAsync(fc_dst[i][r], i, fc_bufs[peer], peer,
-                                    TRANSFER_SIZE, fc_streams[i][r]));
-        }
-      }
-      for (int r = 0; r < ngpu - 1; r++)
-        CHECK(cudaStreamSynchronize(fc_streams[i][r]));
-      auto t1 = std::chrono::high_resolution_clock::now();
-
-      double sec = std::chrono::duration<double>(t1 - t0).count();
+      float ms;
+      CHECK(cudaEventElapsedTime(&ms, fc_starts[i], fc_stops[i]));
       double bytes = (double)(ngpu - 1) * TRANSFER_SIZE * FC_ITERS;
-      fc_bw[i] = bytes / sec / 1e9;
+      fc_bw[i] = bytes / (ms / 1000.0) / 1e9;
     });
   }
   for (auto& t : fc_threads) t.join();
@@ -555,11 +771,16 @@ int main(int argc, char** argv) {
   for (int i = 0; i < ngpu; i++) {
     printf("GPU %d: %.2f GB/s\n", i, fc_bw[i]);
     total_fc += fc_bw[i];
-    ideal_total += sr_bw[i];
+    ideal_total += sw_bw[i];
   }
-  printf("\nTotal system bandwidth: %.2f GB/s\n", total_fc);
+  printf("\nTotal all-to-all bandwidth: %.2f GB/s  (stress test, N*(N-1) flows)\n", total_fc);
   double avg_per_gpu = ideal_total / ngpu;
   static constexpr double PCIE_X16_THEORETICAL = 63.0;  // PCIe 5.0 x16 = 64 GT/s ~ 63 GB/s
+
+  // Ideal ring bandwidth = sum of each link's isolated 1:1 sequential BW.
+  double ideal_ring = 0;
+  for (int i = 0; i < ngpu; i++)
+    ideal_ring += seq_bw[i][(i + 1) % ngpu];
 
   printf("\n");
   printf("===========================================================\n");
@@ -567,17 +788,25 @@ int main(int argc, char** argv) {
   printf("  (%.2f GB/s avg  /  %.1f GB/s PCIe 5.0 x16 theoretical)\n",
          avg_per_gpu, PCIE_X16_THEORETICAL);
   printf("\n");
-  printf("  DENSE INTERCONNECT SCORE:  %.2f\n", total_fc / ideal_total);
-  printf("  (%.2f GB/s measured  /  %.2f GB/s ideal)\n", total_fc, ideal_total);
+  printf("  DENSE INTERCONNECT SCORE:  %.2f\n", total_ring / ideal_ring);
+  printf("  (%.2f GB/s ring  /  %.2f GB/s ideal)\n", total_ring, ideal_ring);
   printf("\n");
   printf("  1.00 = perfect, 0.00 = none\n");
   printf("===========================================================\n");
 
+  // Cleanup.
+  CHECK(cudaFreeHost((void*)sw_flag));
+  CHECK(cudaFreeHost((void*)fc_flag));
   for (int i = 0; i < ngpu; i++) {
     CHECK(cudaSetDevice(i));
-    CHECK(cudaFree(fc_bufs[i]));
+    CHECK(cudaEventDestroy(fc_starts[i]));
+    CHECK(cudaEventDestroy(fc_stops[i]));
+    CHECK(cudaFree(sw_src[i]));
     for (int r = 0; r < ngpu - 1; r++) {
-      CHECK(cudaFree(fc_dst[i][r]));
+      int peer = (i + r + 1) % ngpu;
+      CHECK(cudaSetDevice(peer));
+      CHECK(cudaFree(sw_dst[i][r]));
+      CHECK(cudaSetDevice(i));
       CHECK(cudaStreamDestroy(fc_streams[i][r]));
     }
   }
