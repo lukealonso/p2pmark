@@ -1,0 +1,196 @@
+Found 7 GPUs
+
+=== Sequential P2P bandwidth (GB/s) ===
+Each transfer: 152 MB, 5 iterations
+
+ Dst->  GPU0     GPU1     GPU2     GPU3     GPU4     GPU5     GPU6   
+GPU 0:     -      56.56     56.55     56.58     55.62     55.59     55.59  
+GPU 1:   56.54       -      56.58     56.57     55.61     55.57     55.63  
+GPU 2:   56.57     56.57       -      56.55     55.58     55.58     55.57  
+GPU 3:   56.54     56.56     56.57       -      55.61     55.60     55.59  
+GPU 4:   55.49     55.47     55.63     55.57       -      56.58     56.57  
+GPU 5:   55.58     55.55     55.55     55.63     56.58       -      56.58  
+GPU 6:   55.61     55.63     55.63     55.62     56.53     56.56       -   
+
+=== Topology probe: staggered writes by peer distance (GB/s) ===
+7 concurrent transfers per round, each GPU writing to one unique peer.
+Reveals PCIe switch topology: nearby peers are fast, cross-switch peers are slow.
+
++1  0->1 1->2 2->3 3->4 4->5 5->6 6->0   52.25 avg   365.73 total
++2  0->2 1->3 2->4 3->5 4->6 5->0 6->1   22.66 avg   158.62 total
++3  0->3 1->4 2->5 3->6 4->0 5->1 6->2   22.68 avg   158.75 total
++4  0->4 1->5 2->6 3->0 4->1 5->2 6->3   31.98 avg   223.87 total
++5  0->5 1->6 2->0 3->1 4->2 5->3 6->4   44.47 avg   311.31 total
++6  0->6 1->0 2->1 3->2 4->3 5->4 6->5   53.54 avg   374.76 total
+
+=== Single GPU writes to all 6 peers concurrent (GB/s) ===
+
+GPU 0 writes to all peers: 56.09 GB/s
+GPU 1 writes to all peers: 49.85 GB/s
+GPU 2 writes to all peers: 49.90 GB/s
+GPU 3 writes to all peers: 49.85 GB/s
+GPU 4 writes to all peers: 48.75 GB/s
+GPU 5 writes to all peers: 48.73 GB/s
+GPU 6 writes to all peers: 46.82 GB/s
+
+=== Ring bandwidth: each GPU writes to next neighbor (GB/s) ===
+7 concurrent transfers (one per GPU), matching allreduce ring pattern.
+
+GPU 0 -> GPU 1: 55.74 GB/s
+GPU 1 -> GPU 2: 55.74 GB/s
+GPU 2 -> GPU 3: 55.74 GB/s
+GPU 3 -> GPU 4: 45.17 GB/s
+GPU 4 -> GPU 5: 55.74 GB/s
+GPU 5 -> GPU 6: 55.74 GB/s
+GPU 6 -> GPU 0: 42.30 GB/s
+
+Total ring bandwidth: 366.15 GB/s  (52.31 GB/s avg per GPU)
+
+=== All-to-all fabric stress test (GB/s) ===
+Each GPU has 6 streams, 42 total concurrent transfers [N*(N-1) worst-case].
+
+GPU 0: 25.99 GB/s
+GPU 1: 24.35 GB/s
+GPU 2: 27.04 GB/s
+GPU 3: 26.55 GB/s
+GPU 4: 24.20 GB/s
+GPU 5: 24.14 GB/s
+GPU 6: 26.44 GB/s
+
+Total all-to-all bandwidth: 178.70 GB/s  (stress test, N*(N-1) flows)
+
+===========================================================
+  PCIe LINK SCORE:           0.79
+  (50.00 GB/s avg  /  63.0 GB/s PCIe 5.0 x16 theoretical)
+
+  DENSE INTERCONNECT SCORE:  0.93
+  (366.15 GB/s ring  /  394.06 GB/s ideal)
+
+  1.00 = perfect, 0.00 = none
+===========================================================
+
+
+=== LATENCY MODE (128-byte remote reads, 10000 iterations) ===
+
+=== Sequential P2P latency (us) ===
+
+ Src->  GPU0     GPU1     GPU2     GPU3     GPU4     GPU5     GPU6   
+GPU 0:     -       0.90      0.91      0.87      0.97      1.00      1.01  
+GPU 1:    0.84       -       0.91      0.87      0.97      1.00      0.99  
+GPU 2:    0.88      0.92       -       0.89      0.99      1.02      1.01  
+GPU 3:    0.88      0.91      0.91       -       0.99      1.01      1.02  
+GPU 4:    1.07      1.12      1.11      1.06       -       0.95      0.96  
+GPU 5:    1.08      1.13      1.12      1.10      0.91       -       0.97  
+GPU 6:    1.07      1.10      1.11      1.07      0.93      0.94       -   
+
+Average 1:1 latency: 0.99 us
+
+=== Topology probe: staggered reads by peer distance (us) ===
+7 concurrent kernel launches per round.
+
++1  0<-1 1<-2 2<-3 3<-4 4<-5 5<-6 6<-0    0.95 us avg
++2  0<-2 1<-3 2<-4 3<-5 4<-6 5<-0 6<-1    1.01 us avg
++3  0<-3 1<-4 2<-5 3<-6 4<-0 5<-1 6<-2    1.03 us avg
++4  0<-4 1<-5 2<-6 3<-0 4<-1 5<-2 6<-3    1.04 us avg
++5  0<-5 1<-6 2<-0 3<-1 4<-2 5<-3 6<-4    1.00 us avg
++6  0<-6 1<-0 2<-1 3<-2 4<-3 5<-4 6<-5    0.95 us avg
+
+=== Single reader, all 6 peers concurrent (us) ===
+
+GPU 0: 3.14 us
+GPU 1: 3.13 us
+GPU 2: 3.95 us
+GPU 3: 3.18 us
+GPU 4: 3.25 us
+GPU 5: 3.98 us
+GPU 6: 3.25 us
+
+=== All GPUs read all peers simultaneously (us) ===
+Each GPU has 6 streams, 42 total concurrent kernels.
+
+GPU 0: 3.26 us (max across 6 peers)
+GPU 1: 3.25 us (max across 6 peers)
+GPU 2: 4.05 us (max across 6 peers)
+GPU 3: 3.26 us (max across 6 peers)
+GPU 4: 3.37 us (max across 6 peers)
+GPU 5: 4.10 us (max across 6 peers)
+GPU 6: 3.36 us (max across 6 peers)
+
+===========================================================
+  Min latency:             0.84 us  (best pair, isolated)
+  Mean latency:            3.52 us  (per GPU under full load)
+
+  EFFECTIVE LATENCY:       4.10 us  (all GPUs done reading all peers)
+===========================================================
+
+
+=== ALLREDUCE MODE (7 GPUs, fp16) ===
+
+      Size   Custom (us)     NCCL (us)  Winner
+---------- ------------ ------------ --------
+     256 B           6.9          26.1  custom (3.8x)
+     512 B           6.8          26.0  custom (3.8x)
+      1 KB           6.5          25.7  custom (3.9x)
+      2 KB           7.3          25.0  custom (3.4x)
+      4 KB           7.4          43.0  custom (5.8x)
+      8 KB           8.0          43.2  custom (5.4x)
+     16 KB          14.9          43.8  custom (2.9x)
+     32 KB          15.2          47.6  custom (3.1x)
+     40 KB          17.1          50.1  custom (2.9x)
+     48 KB          20.6          52.1  custom (2.5x)
+     56 KB          21.9          51.0  custom (2.3x)
+     64 KB          25.3          50.3  custom (2.0x)
+    128 KB          45.4          51.9  custom (1.1x)
+    256 KB          84.0          56.5  NCCL (1.5x)
+    512 KB         163.4          95.5  NCCL (1.7x)
+      1 MB         318.2         126.3  NCCL (2.5x)
+      2 MB         612.3         202.2  NCCL (3.0x)
+      4 MB        1266.6         362.9  NCCL (3.5x)
+      8 MB        2397.4         684.3  NCCL (3.5x)
+     16 MB        5001.5        1313.2  NCCL (3.8x)
+     32 MB        9997.7        2654.3  NCCL (3.8x)
+     64 MB       20404.5        5203.7  NCCL (3.9x)
+
+
+=== TP INFERENCE PREFILL SIMULATION (7 GPUs, fp16) ===
+
+Simulates tensor-parallel prefill allreduce communication overhead.
+Each transformer layer does 2 allreduces (post-attention + post-MLP)
+of shape [batch=1, seq_len, hidden_dim] in fp16.
+Uses best of NCCL ring and custom PCIe allreduce at each size.
+Sizes capped at 64 MB to keep fabric load sane.
+
+
+NOTE: Real TP requires power-of-2 GPU count. Your 7 GPUs would use TP=4.
+      Benchmark runs on all 7 GPUs to test the full fabric.
+
+--- Llama-8B (hidden=4096, 32 layers, TP=7) ---
+  SeqLen   AR Size     AR (us)  Layer (us)  Total (ms)       BusBW
+-------- -------- ---------- ---------- ---------- ----------
+     128      1 MB       129.7       259.5         8.3     13.9 GB/s  [nccl]
+     512      4 MB       353.9       707.8        22.6     20.3 GB/s  [nccl]
+    2048     16 MB      1298.0      2596.0        83.1     22.2 GB/s  [nccl]
+    4096     32 MB      2680.9      5361.8       171.6     21.5 GB/s  [nccl]
+
+--- Llama-70B (hidden=8192, 80 layers, TP=7) ---
+  SeqLen   AR Size     AR (us)  Layer (us)  Total (ms)       BusBW
+-------- -------- ---------- ---------- ---------- ----------
+     128      2 MB       210.2       420.4        33.6     17.1 GB/s  [nccl]
+     512      8 MB       676.0      1352.0       108.2     21.3 GB/s  [nccl]
+    2048     32 MB      2689.0      5378.1       430.2     21.4 GB/s  [nccl]
+    4096     64 MB      5215.1     10430.2       834.4     22.1 GB/s  [nccl]
+
+--- Llama-405B (hidden=16384, 126 layers, TP=7) ---
+  SeqLen   AR Size     AR (us)  Layer (us)  Total (ms)       BusBW
+-------- -------- ---------- ---------- ---------- ----------
+     128      4 MB       359.6       719.2        90.6     20.0 GB/s  [nccl]
+     512     16 MB      1320.9      2641.9       332.9     21.8 GB/s  [nccl]
+    2048     64 MB      5212.7     10425.4      1313.6     22.1 GB/s  [nccl]
+
+===========================================================
+  How to read this:
+  'Total (ms)' = pure allreduce time for one full forward pass.
+  Compare against your actual prefill time to find comm overhead %.
+  'BusBW' = bidirectional bus bandwidth [2*(N-1)/N * size / time].
+  A score near your link BW (PCIe 5.0 x16 = 63 GB/s) is optimal.
+===========================================================

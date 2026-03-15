@@ -267,15 +267,51 @@ double measure_bw(int src, int dst, size_t bytes, cudaStream_t stream) {
   return gbps;
 }
 
+static void run_bandwidth_tests(int ngpu);
 static void run_latency_tests(int ngpu);
 static void run_allreduce_tests(int ngpu);
+static void run_tp_sim(int ngpu);
+
+static void enable_all_peer_access(int ngpu) {
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    for (int j = 0; j < ngpu; j++) {
+      if (i == j) continue;
+      int can;
+      CHECK(cudaDeviceCanAccessPeer(&can, i, j));
+      if (can) {
+        cudaDeviceEnablePeerAccess(j, 0);  // ignore already-enabled error
+      }
+    }
+  }
+}
+
+static void print_help(const char* prog) {
+  printf("p2pmark — GPU peer-to-peer bandwidth benchmark\n\n");
+  printf("Usage: %s [MODE]\n\n", prog);
+  printf("Modes (pick one, default is P2P bandwidth matrix):\n");
+  printf("  (none)        NxN sequential + concurrent bandwidth matrix\n");
+  printf("  --latency     P2P latency tests (small transfers)\n");
+  printf("  --allreduce   Allreduce benchmarks (NCCL ring vs custom PCIe)\n");
+  printf("  --tp-sim      TP inference prefill simulation (Llama 8B/70B/405B)\n");
+  printf("  --all         Run all tests in sequence\n");
+  printf("  --help, -h    Show this help\n");
+}
 
 int main(int argc, char** argv) {
   bool latency_mode = false;
   bool allreduce_mode = false;
+  bool tp_sim_mode = false;
+  bool all_mode = false;
   for (int i = 1; i < argc; i++) {
+    if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
+      print_help(argv[0]);
+      return 0;
+    }
     if (std::string(argv[i]) == "--latency") latency_mode = true;
     if (std::string(argv[i]) == "--allreduce") allreduce_mode = true;
+    if (std::string(argv[i]) == "--tp-sim") tp_sim_mode = true;
+    if (std::string(argv[i]) == "--all") all_mode = true;
   }
 
   int ngpu;
@@ -287,31 +323,41 @@ int main(int argc, char** argv) {
     ngpu = 8;
   }
 
-  auto enable_all_peer_access = [&]() {
-    for (int i = 0; i < ngpu; i++) {
-      CHECK(cudaSetDevice(i));
-      for (int j = 0; j < ngpu; j++) {
-        if (i == j) continue;
-        int can;
-        CHECK(cudaDeviceCanAccessPeer(&can, i, j));
-        if (can) {
-          cudaDeviceEnablePeerAccess(j, 0);  // ignore already-enabled error
-        }
-      }
-    }
-  };
-
+  if (all_mode) {
+    // Run everything in sequence.
+    // run_bandwidth_tests enables peer access internally (alloc-before-peer order).
+    // Subsequent tests get it for free (duplicate enable is a harmless no-op).
+    run_bandwidth_tests(ngpu);
+    printf("\n\n");
+    run_latency_tests(ngpu);
+    printf("\n\n");
+    run_allreduce_tests(ngpu);
+    printf("\n\n");
+    run_tp_sim(ngpu);
+    return 0;
+  }
   if (latency_mode) {
-    enable_all_peer_access();
+    enable_all_peer_access(ngpu);
     run_latency_tests(ngpu);
     return 0;
   }
   if (allreduce_mode) {
-    enable_all_peer_access();
+    enable_all_peer_access(ngpu);
     run_allreduce_tests(ngpu);
     return 0;
   }
+  if (tp_sim_mode) {
+    enable_all_peer_access(ngpu);
+    run_tp_sim(ngpu);
+    return 0;
+  }
 
+  // Default: bandwidth tests only.
+  run_bandwidth_tests(ngpu);
+  return 0;
+}
+
+static void run_bandwidth_tests(int ngpu) {
   // ---- Test 1: Sequential NxN ----
   // Pre-allocate all buffers (like NVIDIA's test) to avoid allocator
   // address churn that can affect cross-socket xGMI routing.
@@ -334,7 +380,7 @@ int main(int argc, char** argv) {
   }
 
   // Enable P2P access AFTER allocation (critical for xGMI bandwidth).
-  enable_all_peer_access();
+  enable_all_peer_access(ngpu);
 
   // Host-pinned flag for delay kernel synchronization.
   volatile int *delay_flag;
@@ -810,8 +856,6 @@ int main(int argc, char** argv) {
       CHECK(cudaStreamDestroy(fc_streams[i][r]));
     }
   }
-
-  return 0;
 }
 
 // ---- Latency mode ----
@@ -1110,7 +1154,8 @@ static double bench_custom_ar(int ngpu, size_t sz,
                               std::vector<void*>& input, std::vector<void*>& output,
                               std::vector<pcie_ar::Signal*>& sigs,
                               std::vector<void*>& rd_dev, pcie_ar::RankSignals& rs,
-                              std::vector<cudaStream_t>& streams) {
+                              std::vector<cudaStream_t>& streams,
+                              int iters_override = 0) {
   using T = half;
   constexpr int d = pcie_ar::packed_t<T>::P::size;
   int num_elements = sz / sizeof(T);
@@ -1118,7 +1163,7 @@ static double bench_custom_ar(int ngpu, size_t sz,
   int threads = 512;
   int blocks = std::min(36, (packed_size + threads - 1) / threads);
   blocks = std::max(blocks, 1);
-  int iters = (sz <= 1024 * 1024) ? 2000 : 200;
+  int iters = iters_override > 0 ? iters_override : ((sz <= 1024 * 1024) ? 2000 : 200);
 
   // Reset signals.
   for (int i = 0; i < ngpu; i++) {
@@ -1197,9 +1242,10 @@ static double bench_custom_ar(int ngpu, size_t sz,
 static double bench_nccl_ar(int ngpu, size_t sz,
                             std::vector<void*>& input, std::vector<void*>& output,
                             std::vector<ncclComm_t>& comms,
-                            std::vector<cudaStream_t>& streams) {
+                            std::vector<cudaStream_t>& streams,
+                            int iters_override = 0) {
   int count = sz / sizeof(half);
-  int iters = (sz <= 1024 * 1024) ? 2000 : 200;
+  int iters = iters_override > 0 ? iters_override : ((sz <= 1024 * 1024) ? 2000 : 200);
 
   // Warmup.
   for (int w = 0; w < 20; w++) {
@@ -1317,6 +1363,155 @@ static void run_allreduce_tests(int ngpu) {
     double ratio = (custom_us < nccl_us) ? nccl_us / custom_us : custom_us / nccl_us;
     printf("%10s  %12.1f  %12.1f  %s (%.1fx)\n", sz_str, custom_us, nccl_us, winner, ratio);
   }
+
+  // Cleanup.
+  for (int i = 0; i < ngpu; i++) CHECK_NCCL(ncclCommDestroy(comms[i]));
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaFree(input[i]));
+    CHECK(cudaFree(output[i]));
+    CHECK(cudaFree(sigs[i]));
+    CHECK(cudaFree(rd_dev[i]));
+    CHECK(cudaStreamDestroy(streams[i]));
+  }
+}
+
+// ---- TP inference prefill simulation ----
+
+struct TPModelConfig {
+  const char* name;
+  int hidden_dim;
+  int num_layers;
+};
+
+static void run_tp_sim(int ngpu) {
+  using T = half;
+  constexpr int d = pcie_ar::packed_t<T>::P::size;
+
+  if (ngpu < 2 || ngpu > 8) {
+    fprintf(stderr, "TP sim requires 2-8 GPUs, got %d\n", ngpu);
+    return;
+  }
+
+  static const TPModelConfig models[] = {
+    {"Llama-8B",   4096,  32},
+    {"Llama-70B",  8192,  80},
+    {"Llama-405B", 16384, 126},
+  };
+  static const int seqlens[] = {128, 512, 2048, 4096};
+
+  printf("=== TP INFERENCE PREFILL SIMULATION (%d GPUs, fp16) ===\n\n", ngpu);
+  printf("Simulates tensor-parallel prefill allreduce communication overhead.\n");
+  printf("Each transformer layer does 2 allreduces (post-attention + post-MLP)\n");
+  printf("of shape [batch=1, seq_len, hidden_dim] in fp16.\n");
+  printf("Uses best of NCCL ring and custom PCIe allreduce at each size.\n");
+  printf("Sizes capped at 64 MB to keep fabric load sane.\n\n");
+
+  int p2 = 1;
+  while (p2 * 2 <= ngpu) p2 *= 2;
+  if (p2 != ngpu)
+    printf("\nNOTE: Real TP requires power-of-2 GPU count. Your %d GPUs would use TP=%d.\n"
+           "      Benchmark runs on all %d GPUs to test the full fabric.\n", ngpu, p2, ngpu);
+  printf("\n");
+
+  // Find max allreduce size across all combos (capped at 64 MB).
+  constexpr size_t ALLOC_CAP = 64 * 1024 * 1024;
+  size_t max_sz = 0;
+  for (auto& m : models)
+    for (int sl : seqlens) {
+      size_t sz = (size_t)sl * m.hidden_dim * sizeof(T);
+      if (sz <= ALLOC_CAP && sz > max_sz) max_sz = sz;
+    }
+
+  // Per-GPU resources.
+  std::vector<void*> input(ngpu), output(ngpu);
+  std::vector<pcie_ar::Signal*> sigs(ngpu);
+  std::vector<void*> rd_dev(ngpu);
+  std::vector<cudaStream_t> streams(ngpu);
+
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaMalloc(&input[i], max_sz));
+    CHECK(cudaMalloc(&output[i], max_sz));
+    CHECK(cudaMemset(input[i], i + 1, max_sz));
+    CHECK(cudaMalloc((void**)&sigs[i], sizeof(pcie_ar::Signal)));
+    CHECK(cudaMemset(sigs[i], 0, sizeof(pcie_ar::Signal)));
+    CHECK(cudaStreamCreate(&streams[i]));
+  }
+
+  // Custom allreduce setup.
+  pcie_ar::RankData rd;
+  for (int i = 0; i < ngpu; i++) rd.ptrs[i] = input[i];
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaMalloc(&rd_dev[i], sizeof(pcie_ar::RankData)));
+    CHECK(cudaMemcpy(rd_dev[i], &rd, sizeof(pcie_ar::RankData), cudaMemcpyHostToDevice));
+  }
+  pcie_ar::RankSignals rs;
+  for (int i = 0; i < ngpu; i++) rs.signals[i] = sigs[i];
+
+  // NCCL setup.
+  std::vector<ncclComm_t> comms(ngpu);
+  std::vector<int> devs(ngpu);
+  for (int i = 0; i < ngpu; i++) devs[i] = i;
+  CHECK_NCCL(ncclCommInitAll(comms.data(), ngpu, devs.data()));
+
+  for (const auto& model : models) {
+    printf("--- %s (hidden=%d, %d layers, TP=%d) ---\n",
+           model.name, model.hidden_dim, model.num_layers, ngpu);
+    printf("%8s  %8s  %10s  %10s  %10s  %10s\n",
+           "SeqLen", "AR Size", "AR (us)", "Layer (us)", "Total (ms)", "BusBW");
+    printf("-------- -------- ---------- ---------- ---------- ----------\n");
+
+    for (int sl : seqlens) {
+      size_t sz = (size_t)sl * model.hidden_dim * sizeof(T);
+
+      // Cap at 64 MB to avoid kernel-panicking the box.
+      constexpr size_t MAX_AR_SZ = 64 * 1024 * 1024;
+      if (sz > MAX_AR_SZ) continue;
+
+      int num_elements = sz / sizeof(T);
+      // Light iterations: enough for stable numbers, not enough to melt the fabric.
+      int iters = (sz <= 1024 * 1024) ? 50 : 20;
+
+      // NCCL allreduce.
+      double nccl_us = bench_nccl_ar(ngpu, sz, input, output, comms, streams, iters);
+
+      // Custom PCIe allreduce — only for small sizes where it can win.
+      double best_us = nccl_us;
+      const char* method = "nccl";
+      if (sz <= 8 * 1024 * 1024 && num_elements % d == 0) {
+        double custom_us = bench_custom_ar(ngpu, sz, input, output, sigs, rd_dev, rs, streams, iters);
+        if (custom_us < nccl_us) {
+          best_us = custom_us;
+          method = "custom";
+        }
+      }
+
+      double per_layer_us = best_us * 2;
+      double total_ms = per_layer_us * model.num_layers / 1000.0;
+
+      // Bus bandwidth: allreduce ring moves 2*(N-1)/N * size total bytes.
+      double bus_bw = sz * 2.0 * (ngpu - 1) / ngpu / (best_us / 1e6) / 1e9;
+
+      char sz_str[32];
+      if (sz >= 1024 * 1024) snprintf(sz_str, sizeof(sz_str), "%zu MB", sz / (1024 * 1024));
+      else if (sz >= 1024)   snprintf(sz_str, sizeof(sz_str), "%zu KB", sz / 1024);
+      else                   snprintf(sz_str, sizeof(sz_str), "%zu B", sz);
+
+      printf("%8d  %8s  %10.1f  %10.1f  %10.1f  %7.1f GB/s  [%s]\n",
+             sl, sz_str, best_us, per_layer_us, total_ms, bus_bw, method);
+    }
+    printf("\n");
+  }
+
+  printf("===========================================================\n");
+  printf("  How to read this:\n");
+  printf("  'Total (ms)' = pure allreduce time for one full forward pass.\n");
+  printf("  Compare against your actual prefill time to find comm overhead %%.\n");
+  printf("  'BusBW' = bidirectional bus bandwidth [2*(N-1)/N * size / time].\n");
+  printf("  A score near your link BW (PCIe 5.0 x16 = 63 GB/s) is optimal.\n");
+  printf("===========================================================\n");
 
   // Cleanup.
   for (int i = 0; i < ngpu; i++) CHECK_NCCL(ncclCommDestroy(comms[i]));
